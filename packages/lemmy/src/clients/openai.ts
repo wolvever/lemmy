@@ -299,6 +299,7 @@ export class OpenAIClient implements ChatClient<OpenAIAskOptions> {
 						} catch (parseError) {
 							// Log the problematic JSON for debugging
 							console.error(`Failed to parse tool arguments for tool ${toolCallData.name}:`, parseError);
+							console.error(`Complete toolCallData:`, toolCallData);
 							console.error(
 								`Problematic JSON string (length: ${argsString.length}):`,
 								JSON.stringify(argsString),
