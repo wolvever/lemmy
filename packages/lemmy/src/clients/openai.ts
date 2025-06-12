@@ -308,22 +308,83 @@ export class OpenAIClient implements ChatClient<OpenAIAskOptions> {
 							// Try to fix common issues with malformed JSON
 							let cleanedArgsString = argsString.trim();
 
-							// Remove any trailing non-JSON content after the last closing brace
-							const lastBraceIndex = cleanedArgsString.lastIndexOf("}");
-							if (lastBraceIndex !== -1 && lastBraceIndex < cleanedArgsString.length - 1) {
-								console.log(`Trimming extra content after position ${lastBraceIndex}`);
-								cleanedArgsString = cleanedArgsString.substring(0, lastBraceIndex + 1);
-							}
+							// Check if we have multiple JSON objects concatenated (like {"a":1}{"b":2})
+							const jsonObjectPattern = /\}\s*\{/g;
+							const hasMultipleObjects = jsonObjectPattern.test(cleanedArgsString);
 
-							// Try parsing the cleaned string
-							try {
-								parsedArgs = JSON.parse(cleanedArgsString);
-								console.log(`Successfully parsed cleaned JSON for tool ${toolCallData.name}`);
-							} catch (secondParseError) {
-								console.error(`Still failed to parse cleaned JSON:`, secondParseError);
-								console.error(`Cleaned JSON string:`, JSON.stringify(cleanedArgsString));
-								// Fall back to empty object if we can't parse it
-								parsedArgs = {};
+							if (hasMultipleObjects) {
+								console.log(`Detected concatenated JSON objects, attempting to merge`);
+								try {
+									// Split on '}{'  and reconstruct individual JSON objects
+									const objects = [];
+									let currentPos = 0;
+									let braceCount = 0;
+									let currentObject = "";
+
+									for (let i = 0; i < cleanedArgsString.length; i++) {
+										const char = cleanedArgsString[i];
+										currentObject += char;
+
+										if (char === "{") {
+											braceCount++;
+										} else if (char === "}") {
+											braceCount--;
+											if (braceCount === 0) {
+												// Complete object found
+												try {
+													const parsed = JSON.parse(currentObject.trim());
+													objects.push(parsed);
+													currentObject = "";
+												} catch (e) {
+													// Skip invalid objects
+													currentObject = "";
+												}
+											}
+										}
+									}
+
+									// Merge all parsed objects into one
+									if (objects.length > 0) {
+										parsedArgs = Object.assign({}, ...objects);
+										console.log(
+											`Successfully merged ${objects.length} JSON objects for tool ${toolCallData.name}`,
+										);
+									} else {
+										throw new Error("No valid JSON objects found");
+									}
+								} catch (mergeError) {
+									console.error(`Failed to merge concatenated JSON objects:`, mergeError);
+									// Fall back to trying the first complete JSON object
+									const firstObjectMatch = cleanedArgsString.match(/^\{[^}]*\}/);
+									if (firstObjectMatch) {
+										try {
+											parsedArgs = JSON.parse(firstObjectMatch[0]);
+											console.log(`Used first JSON object as fallback for tool ${toolCallData.name}`);
+										} catch (e) {
+											parsedArgs = {};
+										}
+									} else {
+										parsedArgs = {};
+									}
+								}
+							} else {
+								// Remove any trailing non-JSON content after the last closing brace
+								const lastBraceIndex = cleanedArgsString.lastIndexOf("}");
+								if (lastBraceIndex !== -1 && lastBraceIndex < cleanedArgsString.length - 1) {
+									console.log(`Trimming extra content after position ${lastBraceIndex}`);
+									cleanedArgsString = cleanedArgsString.substring(0, lastBraceIndex + 1);
+								}
+
+								// Try parsing the cleaned string
+								try {
+									parsedArgs = JSON.parse(cleanedArgsString);
+									console.log(`Successfully parsed cleaned JSON for tool ${toolCallData.name}`);
+								} catch (secondParseError) {
+									console.error(`Still failed to parse cleaned JSON:`, secondParseError);
+									console.error(`Cleaned JSON string:`, JSON.stringify(cleanedArgsString));
+									// Fall back to empty object if we can't parse it
+									parsedArgs = {};
+								}
 							}
 						}
 
