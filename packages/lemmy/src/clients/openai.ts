@@ -291,15 +291,49 @@ export class OpenAIClient implements ChatClient<OpenAIAskOptions> {
 						if (argsString.trim() === "") {
 							argsString = "{}";
 						}
-						const parsedArgs = JSON.parse(argsString);
+
+						// Try to parse the JSON, with fallback handling for malformed JSON
+						let parsedArgs;
+						try {
+							parsedArgs = JSON.parse(argsString);
+						} catch (parseError) {
+							// Log the problematic JSON for debugging
+							console.error(`Failed to parse tool arguments for tool ${toolCallData.name}:`, parseError);
+							console.error(
+								`Problematic JSON string (length: ${argsString.length}):`,
+								JSON.stringify(argsString),
+							);
+
+							// Try to fix common issues with malformed JSON
+							let cleanedArgsString = argsString.trim();
+
+							// Remove any trailing non-JSON content after the last closing brace
+							const lastBraceIndex = cleanedArgsString.lastIndexOf("}");
+							if (lastBraceIndex !== -1 && lastBraceIndex < cleanedArgsString.length - 1) {
+								console.log(`Trimming extra content after position ${lastBraceIndex}`);
+								cleanedArgsString = cleanedArgsString.substring(0, lastBraceIndex + 1);
+							}
+
+							// Try parsing the cleaned string
+							try {
+								parsedArgs = JSON.parse(cleanedArgsString);
+								console.log(`Successfully parsed cleaned JSON for tool ${toolCallData.name}`);
+							} catch (secondParseError) {
+								console.error(`Still failed to parse cleaned JSON:`, secondParseError);
+								console.error(`Cleaned JSON string:`, JSON.stringify(cleanedArgsString));
+								// Fall back to empty object if we can't parse it
+								parsedArgs = {};
+							}
+						}
+
 						toolCalls.push({
 							id: toolCallData.id,
 							name: toolCallData.name,
 							arguments: parsedArgs,
 						});
 					} catch (error) {
-						// Invalid JSON in tool arguments - we'll handle this as an error
-						console.error("Failed to parse tool arguments:", error);
+						// Unexpected error in tool call processing
+						console.error("Unexpected error processing tool call:", error);
 					}
 				}
 			}
