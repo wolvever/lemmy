@@ -309,25 +309,12 @@ export class OpenAIClient implements ChatClient<OpenAIAskOptions> {
 									return "{" + part + "}";
 								});
 
-								// Parse each JSON object and handle duplicate keys properly
+								// Parse each JSON object and merge them
 								const mergedArgs: Record<string, unknown> = {};
-								const arrayKeys = new Set<string>();
-
 								for (const jsonStr of jsonStrings) {
 									try {
 										const parsed = JSON.parse(jsonStr);
-										for (const [key, value] of Object.entries(parsed)) {
-											if (mergedArgs[key] !== undefined) {
-												// Duplicate key found - convert to array
-												if (!arrayKeys.has(key)) {
-													mergedArgs[key] = [mergedArgs[key]];
-													arrayKeys.add(key);
-												}
-												(mergedArgs[key] as unknown[]).push(value);
-											} else {
-												mergedArgs[key] = value;
-											}
-										}
+										Object.assign(mergedArgs, parsed);
 									} catch (err) {
 										console.error(`Failed to parse individual JSON object: ${jsonStr}`, err);
 									}
