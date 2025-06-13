@@ -229,12 +229,9 @@ export class OpenAIClient implements ChatClient<OpenAIAskOptions> {
 		let stopReason: string | undefined;
 		let toolCalls: ToolCall[] = [];
 		const currentToolCalls = new Map<number, { id?: string; name?: string; arguments?: string }>();
-		let allChunks: OpenAI.Chat.ChatCompletionChunk[] = []; // Store all chunks for debugging
 
 		try {
 			for await (const chunk of stream) {
-				// Store chunk for debugging
-				allChunks.push(chunk);
 				// Handle usage information (comes in final chunk with stream_options)
 				if (chunk.usage) {
 					inputTokens = chunk.usage.prompt_tokens || 0;
@@ -308,54 +305,69 @@ export class OpenAIClient implements ChatClient<OpenAIAskOptions> {
 								JSON.stringify(argsString),
 							);
 
-							// Log relevant streaming chunks for debugging
-							console.error(`LLM Response Debug - Tool call chunks for ${toolCallData.name}:`);
-							const relevantChunks = allChunks.filter((chunk) =>
-								chunk.choices?.[0]?.delta?.tool_calls?.some((tc) => tc.id === toolCallData.id),
-							);
-							if (relevantChunks.length > 0) {
-								console.error(`Found ${relevantChunks.length} relevant chunks:`);
-								relevantChunks.forEach((chunk, i) => {
-									console.error(`Chunk ${i}:`, JSON.stringify(chunk.choices?.[0]?.delta?.tool_calls, null, 2));
-								});
-							} else {
-								console.error(`No relevant chunks found for tool ID ${toolCallData.id}`);
-							}
+							// Try to fix common issues with malformed JSON
+							let cleanedArgsString = argsString.trim();
 
-							// Check if this looks like concatenated JSON objects (Claude-style)
-							if (argsString.includes("}{")) {
-								console.log("Detected concatenated JSON objects, attempting to merge");
+							// Check if we have multiple JSON objects concatenated (like {"a":1}{"b":2})
+							const jsonObjectPattern = /\}\s*\{/g;
+							const hasMultipleObjects = jsonObjectPattern.test(cleanedArgsString);
+
+							if (hasMultipleObjects) {
+								console.log(`Detected concatenated JSON objects, attempting to merge`);
 								try {
-									// Split by }{ and reconstruct as separate objects
-									const jsonStrings = argsString.split("}{").map((part, index, array) => {
-										if (index === 0) return part + "}";
-										if (index === array.length - 1) return "{" + part;
-										return "{" + part + "}";
-									});
+									// Split on '}{'  and reconstruct individual JSON objects
+									const objects = [];
+									let currentPos = 0;
+									let braceCount = 0;
+									let currentObject = "";
 
-									// Parse each JSON object and merge them
-									const mergedArgs: Record<string, unknown> = {};
-									for (const jsonStr of jsonStrings) {
-										try {
-											const parsed = JSON.parse(jsonStr);
-											Object.assign(mergedArgs, parsed);
-										} catch (err) {
-											console.error(`Failed to parse individual JSON object: ${jsonStr}`, err);
+									for (let i = 0; i < cleanedArgsString.length; i++) {
+										const char = cleanedArgsString[i];
+										currentObject += char;
+
+										if (char === "{") {
+											braceCount++;
+										} else if (char === "}") {
+											braceCount--;
+											if (braceCount === 0) {
+												// Complete object found
+												try {
+													const parsed = JSON.parse(currentObject.trim());
+													objects.push(parsed);
+													currentObject = "";
+												} catch (e) {
+													// Skip invalid objects
+													currentObject = "";
+												}
+											}
 										}
 									}
 
-									parsedArgs = mergedArgs;
-									console.log(
-										`Successfully merged ${jsonStrings.length} JSON objects for tool ${toolCallData.name}`,
-									);
+									// Merge all parsed objects into one
+									if (objects.length > 0) {
+										parsedArgs = Object.assign({}, ...objects);
+										console.log(
+											`Successfully merged ${objects.length} JSON objects for tool ${toolCallData.name}`,
+										);
+									} else {
+										throw new Error("No valid JSON objects found");
+									}
 								} catch (mergeError) {
-									console.error(`Failed to merge concatenated JSON:`, mergeError);
-									parsedArgs = {};
+									console.error(`Failed to merge concatenated JSON objects:`, mergeError);
+									// Fall back to trying the first complete JSON object
+									const firstObjectMatch = cleanedArgsString.match(/^\{[^}]*\}/);
+									if (firstObjectMatch) {
+										try {
+											parsedArgs = JSON.parse(firstObjectMatch[0]);
+											console.log(`Used first JSON object as fallback for tool ${toolCallData.name}`);
+										} catch (e) {
+											parsedArgs = {};
+										}
+									} else {
+										parsedArgs = {};
+									}
 								}
 							} else {
-								// Try to fix common issues with malformed JSON
-								let cleanedArgsString = argsString.trim();
-
 								// Remove any trailing non-JSON content after the last closing brace
 								const lastBraceIndex = cleanedArgsString.lastIndexOf("}");
 								if (lastBraceIndex !== -1 && lastBraceIndex < cleanedArgsString.length - 1) {
