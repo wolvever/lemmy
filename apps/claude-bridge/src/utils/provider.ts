@@ -24,53 +24,138 @@ import type {
 
 import type { MessageCreateParamsBase } from "@anthropic-ai/sdk/resources/messages/messages.js";
 
+// Add debug logging wrapper for clients
+function wrapClientWithLogging(client: ChatClient, provider: Provider, debug: boolean): ChatClient {
+	if (!debug) return client;
+
+	return {
+		...client,
+		ask: async (...args: Parameters<ChatClient["ask"]>) => {
+			const request = args[0];
+			const config = (client as any).config || {};
+			const fullUrl = `${config.baseURL}/chat/completions`;
+			console.debug(`[${provider}] Full Request Details:`, {
+				baseURL: config.baseURL,
+				fullUrl,
+				headers: {
+					Authorization: "Bearer " + (config.apiKey ? "***" + config.apiKey.slice(-4) : "undefined"),
+					"Content-Type": "application/json",
+				},
+				body: request,
+			});
+			const response = await client.ask(...args);
+			console.debug(`[${provider}] Response:`, JSON.stringify(response, null, 2));
+			return response;
+		},
+	};
+}
+
 /**
  * Create provider-agnostic client for a given model
  */
 export async function createProviderClient(config: BridgeConfig): Promise<ProviderClientInfo> {
-	// For known models, use the registry
-	const modelData = findModelData(config.model);
 	let provider: Provider;
 	let client: ChatClient;
 
-	if (modelData) {
-		// Known model - use standard approach
-		provider = getProviderForModel(config.model as AllModels) as Provider;
-		const providerConfig = buildProviderConfig(provider, config);
-		client = createClientForModel(config.model as AllModels, providerConfig);
-	} else {
-		// Unknown model - use the configured provider directly
-		provider = config.provider;
+	// If proxy provider is specified, use it directly without model registry lookup
+	if (config.provider === "proxy") {
+		provider = "proxy";
 		const providerConfig = buildProviderConfig(provider, config);
 
-		// Create client directly using lemmy's provider factories
-		switch (provider) {
-			case "openai": {
-				const { lemmy } = await import("@mariozechner/lemmy");
-				client = lemmy.openai(providerConfig as OpenAIConfig);
-				break;
+		// Create OpenAI-compatible client for proxy
+		const { lemmy } = await import("@mariozechner/lemmy");
+		const baseURL = providerConfig.baseURL?.endsWith("/v1/chat/completions")
+			? providerConfig.baseURL
+			: providerConfig.baseURL?.endsWith("/v1")
+				? `${providerConfig.baseURL}/chat/completions`
+				: `${providerConfig.baseURL}/v1/chat/completions`;
+
+		console.debug(`[${provider}] Setting up client with baseURL:`, baseURL);
+
+		client = lemmy.openai({
+			...(providerConfig as OpenAIConfig),
+			baseURL,
+		});
+
+		// Wrap the client to handle Anthropic-style tool parsing and request transformation
+		client = {
+			...client,
+			ask: async (options: any) => {
+				// Transform request to OpenAI format
+				const openaiRequest: any = {
+					model: options.model || config.model,
+					messages: [
+						{
+							role: "user",
+							content: options.content,
+						},
+					],
+					stream: false,
+					max_tokens: options.maxOutputTokens || 512,
+					temperature: 0.7,
+				};
+
+				// Parse tools in Anthropic style before sending to OpenAI-compatible API
+				if (options.tools) {
+					openaiRequest.tools = options.tools.map((tool: any) => ({
+						type: "function",
+						function: {
+							name: tool.name,
+							description: tool.description,
+							parameters: tool.input_schema,
+						},
+					}));
+				}
+
+				return client.ask(openaiRequest);
+			},
+		};
+	} else {
+		// For known models, use the registry
+		const modelData = findModelData(config.model);
+
+		if (modelData) {
+			// Known model - use standard approach
+			provider = getProviderForModel(config.model as AllModels) as Provider;
+			const providerConfig = buildProviderConfig(provider, config);
+			client = createClientForModel(config.model as AllModels, providerConfig);
+		} else {
+			// Unknown model - use the configured provider directly
+			provider = config.provider;
+			const providerConfig = buildProviderConfig(provider, config);
+
+			// Create client directly using lemmy's provider factories
+			switch (provider) {
+				case "openai": {
+					const { lemmy } = await import("@mariozechner/lemmy");
+					client = lemmy.openai(providerConfig as OpenAIConfig);
+					break;
+				}
+				case "google": {
+					const { lemmy } = await import("@mariozechner/lemmy");
+					client = lemmy.google(providerConfig as GoogleConfig);
+					break;
+				}
+				case "anthropic": {
+					const { lemmy } = await import("@mariozechner/lemmy");
+					client = lemmy.anthropic(providerConfig as AnthropicConfig);
+					break;
+				}
+				default:
+					const _exhaustiveCheck: never = provider;
+					throw new Error(`Unsupported provider: ${_exhaustiveCheck}`);
 			}
-			case "google": {
-				const { lemmy } = await import("@mariozechner/lemmy");
-				client = lemmy.google(providerConfig as GoogleConfig);
-				break;
-			}
-			case "anthropic": {
-				const { lemmy } = await import("@mariozechner/lemmy");
-				client = lemmy.anthropic(providerConfig as AnthropicConfig);
-				break;
-			}
-			default:
-				const _exhaustiveCheck: never = provider;
-				throw new Error(`Unsupported provider: ${_exhaustiveCheck}`);
 		}
 	}
+
+	// Wrap all clients with debug logging if debug mode is enabled
+	client = wrapClientWithLogging(client, provider, config.debug || false);
 
 	return {
 		client,
 		provider,
 		model: config.model,
-		modelData: modelData || null, // null for unknown models
+		modelData: findModelData(config.model) || null,
 	};
 }
 
@@ -89,6 +174,7 @@ function buildProviderConfig(provider: Provider, config: BridgeConfig): Provider
 		case "anthropic":
 			return baseConfig as AnthropicConfig;
 		case "openai":
+		case "proxy":
 			return baseConfig as OpenAIConfig;
 		case "google":
 			return baseConfig as GoogleConfig;
@@ -109,6 +195,7 @@ function getDefaultApiKey(provider: Provider): string {
 			if (!anthropicKey) throw new Error("ANTHROPIC_API_KEY environment variable is required");
 			return anthropicKey;
 		case "openai":
+		case "proxy":
 			const openaiKey = process.env["OPENAI_API_KEY"];
 			if (!openaiKey) throw new Error("OPENAI_API_KEY environment variable is required");
 			return openaiKey;
@@ -208,6 +295,7 @@ export function convertThinkingParameters(
 			return options;
 
 		case "openai":
+		case "proxy":
 			return {
 				...baseOptions,
 				...(anthropicRequest.thinking?.type == "enabled" && {
