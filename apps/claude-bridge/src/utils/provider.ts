@@ -22,7 +22,11 @@ import type {
 	ProviderConfig,
 } from "../types.js";
 
-import type { MessageCreateParamsBase } from "@anthropic-ai/sdk/resources/messages/messages.js";
+import type {
+	MessageCreateParamsBase,
+	ThinkingConfigEnabled,
+	ThinkingBlock,
+} from "@anthropic-ai/sdk/resources/messages/messages.js";
 
 // Add debug logging wrapper for clients
 function wrapClientWithLogging(client: ChatClient, provider: Provider, debug: boolean): ChatClient {
@@ -34,14 +38,14 @@ function wrapClientWithLogging(client: ChatClient, provider: Provider, debug: bo
 			const request = args[0];
 			const config = (client as any).config || {};
 			const fullUrl = `${config.baseURL}/chat/completions`;
-			console.debug(`[${provider}] Full Request Details:`, {
+			console.debug(`[${provider}] Request:`, {
 				baseURL: config.baseURL,
 				fullUrl,
 				headers: {
 					Authorization: "Bearer " + (config.apiKey ? "***" + config.apiKey.slice(-4) : "undefined"),
 					"Content-Type": "application/json",
 				},
-				body: request,
+				body: JSON.stringify(request, null, 2),
 			});
 			const response = await client.ask(...args);
 			console.debug(`[${provider}] Response:`, JSON.stringify(response, null, 2));
@@ -87,13 +91,32 @@ export async function createProviderClient(config: BridgeConfig): Promise<Provid
 					messages: [
 						{
 							role: "user",
-							content: options.content,
+							content: Array.isArray(options.content)
+								? options.content
+								: [
+										{
+											type: "text",
+											text: options.content,
+										},
+									],
 						},
 					],
 					stream: false,
 					max_tokens: options.maxOutputTokens || 512,
 					temperature: 0.7,
 				};
+
+				// Handle tool results if present
+				if (options.toolResults && Array.isArray(options.toolResults)) {
+					// Add tool results to the content array of the first message
+					openaiRequest.messages[0].content.push(
+						...options.toolResults.map((result: any) => ({
+							type: "tool_result",
+							tool_use_id: result.toolCallId,
+							content: result.content,
+						})),
+					);
+				}
 
 				// Parse tools in Anthropic style before sending to OpenAI-compatible API
 				if (options.tools) {
@@ -107,7 +130,54 @@ export async function createProviderClient(config: BridgeConfig): Promise<Provid
 					}));
 				}
 
-				return client.ask(openaiRequest);
+				// Handle thinking parameters
+				if (options.thinking?.type === "enabled") {
+					// Add thinking configuration to root request
+					openaiRequest.thinking = {
+						type: "enabled",
+						budget_tokens: options.thinking.budget_tokens,
+					} as ThinkingConfigEnabled;
+
+					// Add thinking block to each message's content
+					openaiRequest.messages = openaiRequest.messages.map((msg: any) => {
+						const content = Array.isArray(msg.content)
+							? msg.content
+							: [
+									{
+										type: "text",
+										text: msg.content,
+									},
+								];
+
+						// Add thinking block to content
+						const thinkingBlock: ThinkingBlock = {
+							type: "thinking",
+							thinking: "",
+							signature: "",
+						};
+						content.push(thinkingBlock);
+
+						return {
+							...msg,
+							content,
+						};
+					});
+				}
+
+				// Log the request
+				console.debug(`[${provider}] Request:`, {
+					baseURL: config.baseURL,
+					fullUrl: `${config.baseURL}/chat/completions`,
+					headers: {
+						Authorization: "Bearer " + (config.apiKey ? "***" + config.apiKey.slice(-4) : "undefined"),
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify(openaiRequest, null, 2),
+				});
+
+				const response = await client.ask(openaiRequest);
+				console.debug(`[${provider}] Response:`, JSON.stringify(response, null, 2));
+				return response;
 			},
 		};
 	} else {
@@ -256,56 +326,63 @@ export function validateCapabilities(
 }
 
 /**
+ * Validate thinking parameters
+ */
+function validateThinkingParameters(thinking: ThinkingConfigEnabled | undefined): void {
+	if (!thinking) return;
+
+	if (thinking.type !== "enabled") {
+		throw new Error("Invalid thinking type. Only 'enabled' is supported.");
+	}
+
+	if (thinking.budget_tokens !== undefined) {
+		if (typeof thinking.budget_tokens !== "number" || thinking.budget_tokens < 1024) {
+			throw new Error("Invalid thinking budget_tokens. Must be a number >= 1024.");
+		}
+	}
+}
+
+/**
  * Convert thinking parameters based on provider type
  */
-export function convertThinkingParameters(
-	provider: Provider,
-	anthropicRequest: MessageCreateParamsBase,
-): AnthropicAskOptions | OpenAIAskOptions | GoogleAskOptions {
-	const baseOptions = {
-		maxOutputTokens: anthropicRequest.max_tokens,
-	};
+export function convertThinkingParameters(thinking: ThinkingConfigEnabled | undefined, provider: Provider) {
+	if (!thinking) {
+		return undefined;
+	}
 
+	// Validate thinking parameters
+	if (thinking.type !== "enabled") {
+		throw new Error('Invalid thinking configuration: type must be "enabled"');
+	}
+
+	if (typeof thinking.budget_tokens !== "number" || thinking.budget_tokens < 1024) {
+		throw new Error("Invalid thinking configuration: budget_tokens must be a number >= 1024");
+	}
+
+	// Convert based on provider
 	switch (provider) {
 		case "anthropic":
 			return {
-				...baseOptions,
-				// Anthropic uses the same thinking parameters
-				...(anthropicRequest.thinking?.type == "enabled" && {
-					thinkingEnabled: true,
-				}),
-				...(anthropicRequest.thinking?.type == "enabled" &&
-					anthropicRequest.thinking.budget_tokens !== undefined && {
-						maxThinkingTokens: anthropicRequest.thinking.budget_tokens,
-					}),
-			} as AnthropicAskOptions;
-
-		case "google":
-			const options: GoogleAskOptions = {
-				...baseOptions,
-				// Google uses includeThoughts for thinking
-				...(anthropicRequest.thinking?.type == "enabled" && {
-					includeThoughts: true,
-				}),
-				...(anthropicRequest.thinking?.type == "enabled" &&
-					anthropicRequest.thinking.budget_tokens !== undefined && {
-						thinkingBudget: anthropicRequest.thinking.budget_tokens,
-					}),
+				type: "enabled",
+				budget_tokens: thinking.budget_tokens,
 			};
-			return options;
-
+		case "google":
+			return {
+				includeThoughts: true,
+				thinkingBudget: thinking.budget_tokens,
+			};
 		case "openai":
+			return {
+				reasoningEffort: "high",
+			};
 		case "proxy":
 			return {
-				...baseOptions,
-				...(anthropicRequest.thinking?.type == "enabled" && {
-					reasoningEffort: "medium" as const,
-				}),
-			} as OpenAIAskOptions;
-
+				thinking: {
+					type: "enabled",
+					budget_tokens: thinking.budget_tokens,
+				},
+			};
 		default:
-			// TypeScript exhaustiveness check
-			const _exhaustiveCheck: never = provider;
-			throw new Error(`Unsupported provider: ${_exhaustiveCheck}`);
+			return undefined;
 	}
 }

@@ -1,5 +1,5 @@
 import type { SerializedContext, ChatClient } from "@mariozechner/lemmy";
-import type { MessageCreateParamsBase } from "@anthropic-ai/sdk/resources/messages/messages.js";
+import type { MessageCreateParamsBase, ThinkingConfigEnabled } from "@anthropic-ai/sdk/resources/messages/messages.js";
 import type { AnthropicConfig, OpenAIConfig, GoogleConfig } from "@mariozechner/lemmy";
 import type { ModelData } from "@mariozechner/lemmy";
 
