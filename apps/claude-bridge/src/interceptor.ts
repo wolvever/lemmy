@@ -31,7 +31,6 @@ import { parseSSE, extractAssistantFromSSE } from "./utils/sse.js";
 import {
 	parseAnthropicMessageCreateRequest,
 	parseResponse,
-	isAnthropicAPI,
 	generateRequestId,
 	type ParsedRequestData,
 } from "./utils/request-parser.js";
@@ -464,4 +463,11 @@ export async function initializeInterceptor(config?: BridgeConfig): Promise<Clau
 
 export function getInterceptor(): ClaudeBridgeInterceptor | null {
 	return globalInterceptor;
+}
+
+/**
+ * Check if URL is an Anthropic API endpoint
+ */
+export function isAnthropicAPI(url: string): boolean {
+	return url.includes("api.anthropic.com") && url.includes("/v1/messages");
 }

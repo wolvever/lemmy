@@ -37,19 +37,51 @@ function wrapClientWithLogging(client: ChatClient, provider: Provider, debug: bo
 		ask: async (...args: Parameters<ChatClient["ask"]>) => {
 			const request = args[0];
 			const config = (client as any).config || {};
-			const fullUrl = `${config.baseURL}/chat/completions`;
-			console.debug(`[${provider}] Request:`, {
-				baseURL: config.baseURL,
-				fullUrl,
-				headers: {
-					Authorization: "Bearer " + (config.apiKey ? "***" + config.apiKey.slice(-4) : "undefined"),
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify(request, null, 2),
-			});
-			const response = await client.ask(...args);
-			console.debug(`[${provider}] Response:`, JSON.stringify(response, null, 2));
-			return response;
+
+			// For OpenAI provider, the request will be transformed internally
+			// so we just log what we're sending to the lemmy client
+			if (provider === "openai") {
+				console.debug(`[${provider}] Sending request to lemmy client:`, {
+					model: config.model,
+					baseURL: config.baseURL,
+					request: JSON.stringify(request, null, 2),
+				});
+			} else {
+				const fullUrl = config.baseURL?.endsWith("/completions")
+					? config.baseURL
+					: `${config.baseURL}/chat/completions`;
+
+				// Generate curl command for easy debugging
+				const curlCommand = [
+					"curl",
+					"-X POST",
+					`"${fullUrl}"`,
+					'-H "Content-Type: application/json"',
+					`-H "Authorization: Bearer ${config.apiKey || "YOUR_API_KEY"}"`,
+					`-d '${JSON.stringify(request)}'`,
+				].join(" \\\n  ");
+
+				console.debug(`[${provider}] Request as curl command:\n${curlCommand}`);
+
+				console.debug(`[${provider}] Request details:`, {
+					baseURL: config.baseURL,
+					fullUrl,
+					headers: {
+						Authorization: "Bearer " + (config.apiKey ? "***" + config.apiKey.slice(-4) : "undefined"),
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify(request, null, 2),
+				});
+			}
+
+			try {
+				const response = await client.ask(...args);
+				console.debug(`[${provider}] Response:`, JSON.stringify(response, null, 2));
+				return response;
+			} catch (error) {
+				console.debug(`[${provider}] Error:`, error);
+				throw error;
+			}
 		},
 	};
 }
@@ -68,11 +100,13 @@ export async function createProviderClient(config: BridgeConfig): Promise<Provid
 
 		// Create OpenAI-compatible client for proxy
 		const { lemmy } = await import("@mariozechner/lemmy");
-		const baseURL = providerConfig.baseURL?.endsWith("/v1/chat/completions")
+		const baseURL = providerConfig.baseURL?.endsWith("/completions")
 			? providerConfig.baseURL
-			: providerConfig.baseURL?.endsWith("/v1")
-				? `${providerConfig.baseURL}/chat/completions`
-				: `${providerConfig.baseURL}/v1/chat/completions`;
+			: providerConfig.baseURL?.endsWith("/v1/chat")
+				? `${providerConfig.baseURL}/completions`
+				: providerConfig.baseURL?.endsWith("/v1")
+					? `${providerConfig.baseURL}/chat/completions`
+					: `${providerConfig.baseURL}/v1/chat/completions`;
 
 		console.debug(`[${provider}] Setting up client with baseURL:`, baseURL);
 
@@ -86,28 +120,32 @@ export async function createProviderClient(config: BridgeConfig): Promise<Provid
 			...client,
 			ask: async (options: any) => {
 				// Transform request to OpenAI format
+				const contentBlocks = Array.isArray(options.content)
+					? options.content
+					: [{ type: "text", text: options.content }];
+
 				const openaiRequest: any = {
 					model: options.model || config.model,
 					messages: [
 						{
 							role: "user",
-							content: Array.isArray(options.content)
-								? options.content
-								: [
-										{
-											type: "text",
-											text: options.content,
-										},
-									],
+							content:
+								contentBlocks.length === 1 && contentBlocks[0]?.type === "text"
+									? contentBlocks[0].text
+									: contentBlocks,
 						},
 					],
 					stream: false,
 					max_tokens: options.maxOutputTokens || 512,
-					temperature: 0.7,
+					temperature: options.temperature || 0.7,
 				};
 
 				// Handle tool results if present
 				if (options.toolResults && Array.isArray(options.toolResults)) {
+					// Ensure content is an array before pushing tool results
+					if (typeof openaiRequest.messages[0].content === "string") {
+						openaiRequest.messages[0].content = [{ type: "text", text: openaiRequest.messages[0].content }];
+					}
 					// Add tool results to the content array of the first message
 					openaiRequest.messages[0].content.push(
 						...options.toolResults.map((result: any) => ({
@@ -165,15 +203,33 @@ export async function createProviderClient(config: BridgeConfig): Promise<Provid
 				}
 
 				// Log the request
-				console.debug(`[${provider}] Request:`, {
-					baseURL: config.baseURL,
-					fullUrl: `${config.baseURL}/chat/completions`,
-					headers: {
-						Authorization: "Bearer " + (config.apiKey ? "***" + config.apiKey.slice(-4) : "undefined"),
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify(openaiRequest, null, 2),
-				});
+				if (config.debug) {
+					const fullUrl = config.baseURL?.endsWith("/completions")
+						? config.baseURL
+						: `${config.baseURL}/chat/completions`;
+
+					// Generate curl command for easy debugging
+					const curlCommand = [
+						"curl",
+						"-X POST",
+						`"${fullUrl}"`,
+						'-H "Content-Type: application/json"',
+						`-H "Authorization: Bearer ${config.apiKey || "YOUR_API_KEY"}"`,
+						`-d '${JSON.stringify(openaiRequest)}'`,
+					].join(" \\\n  ");
+
+					console.debug(`[${provider}] Request as curl command:\n${curlCommand}`);
+
+					console.debug(`[${provider}] Request details:`, {
+						baseURL: config.baseURL,
+						fullUrl,
+						headers: {
+							Authorization: "Bearer " + (config.apiKey ? "***" + config.apiKey.slice(-4) : "undefined"),
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify(openaiRequest, null, 2),
+					});
+				}
 
 				const response = await client.ask(openaiRequest);
 				console.debug(`[${provider}] Response:`, JSON.stringify(response, null, 2));
@@ -198,7 +254,12 @@ export async function createProviderClient(config: BridgeConfig): Promise<Provid
 			switch (provider) {
 				case "openai": {
 					const { lemmy } = await import("@mariozechner/lemmy");
-					client = lemmy.openai(providerConfig as OpenAIConfig);
+					// For custom baseURL, pass it directly without modification
+					client = lemmy.openai({
+						...(providerConfig as OpenAIConfig),
+						// Keep the user's baseURL exactly as provided
+						baseURL: config.baseURL,
+					});
 					break;
 				}
 				case "google": {
@@ -219,7 +280,10 @@ export async function createProviderClient(config: BridgeConfig): Promise<Provid
 	}
 
 	// Wrap all clients with debug logging if debug mode is enabled
-	client = wrapClientWithLogging(client, provider, config.debug || false);
+	// Skip for proxy provider as it has its own logging
+	if (provider !== "proxy") {
+		client = wrapClientWithLogging(client, provider, config.debug || false);
+	}
 
 	return {
 		client,
